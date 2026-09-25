@@ -1,6 +1,13 @@
 # Smart Card Reader ==================
 using_smartcard = false
 
+# Amusement IC access code ===========
+read_access_code = true
+# SmartCard readers only. When true, Amusement IC cards (new Aime, Banapass, e-amusement pass...)
+# report the access code printed on the back of the card instead of a code made from the card's chip ID.
+# If the card has no readable access code, the chip ID code is used as before.
+# Set to false to always use the chip ID code (the old behaviour).
+
 # Card Read Cooldown =================
 read_cooldown = 20
 # Default is 20. Set to a higher value if you notice any weird behaviour.

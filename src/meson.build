@@ -20,6 +20,7 @@ shared_library(
         'cardreader_plugin/dllmain.c',
         'cardreader_plugin/CardIO/cardio.c',
         'cardreader_plugin/SmartCard/scard.c',
+        'cardreader_plugin/SmartCard/spad0.c',
     ],
     dependencies: deps,
     include_directories: [

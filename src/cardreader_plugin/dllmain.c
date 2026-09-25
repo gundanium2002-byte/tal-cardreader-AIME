@@ -15,6 +15,7 @@ static bool HasCard = false;
 
 // Misc
 bool usingSmartCard = false;
+bool readAccessCode = true;
 int readCooldown = 200;
 
 typedef void (*callbackTouch)(i32, i32, u8[168], u64);
@@ -42,6 +43,7 @@ static unsigned int __stdcall reader_poll_thread_proc(void *ctx)
         {
 
             uint8_t UID[8] = {0};
+            char CardAccessCode[21] = {0}; // Filled when the printed access code could be read from the card
 
             // update devices
             if (!usingSmartCard) // CardIO
@@ -71,7 +73,7 @@ static unsigned int __stdcall reader_poll_thread_proc(void *ctx)
             }
             else // SmartCard
             {
-                scard_update(UID);
+                scard_update(UID, CardAccessCode);
             }
 
             if (UID[0] > 0) // If a card was read, format it properly and set HasCard to true so the game can insert it on next frame.
@@ -80,11 +82,19 @@ static unsigned int __stdcall reader_poll_thread_proc(void *ctx)
 
                 if (waitingForTouch) // Check if game is waiting for a card.
                 {
-                    // Properly format the AccessID
-                    u64 ReversedAccessID;
-                    for (int i = 0; i < 8; i++)
-                        ReversedAccessID = (ReversedAccessID << 8) | UID[i];
-                    sprintf(AccessID, "%020llu", ReversedAccessID);
+                    if (CardAccessCode[0] != '\0')
+                    {
+                        // Use the access code stored on the card (the number printed on the back)
+                        memcpy(AccessID, CardAccessCode, 21);
+                    }
+                    else
+                    {
+                        // Properly format the AccessID from the card UID / IDm
+                        u64 ReversedAccessID = 0;
+                        for (int i = 0; i < 8; i++)
+                            ReversedAccessID = (ReversedAccessID << 8) | UID[i];
+                        sprintf(AccessID, "%020llu", ReversedAccessID);
+                    }
 
                     waitingForTouch = false; // We don't want to read more cards unless the game asks us to, this is a failsafe to avoid weird behaviour.
                     HasCard = true;
@@ -163,6 +173,7 @@ void Init()
     {
         usingSmartCard = readConfigBool(config, "using_smartcard", false);
         readCooldown = readConfigInt(config, "read_cooldown", usingSmartCard ? 500 : 50);
+        readAccessCode = readConfigBool(config, "read_access_code", true);
         toml_free(config);
     }
     else
@@ -173,6 +184,8 @@ void Init()
 
     printInfo("%s (%s): Using %s as reader type\n", __func__, module, usingSmartCard ? "Smart Card" : "cardIO");
     printInfo("%s (%s): Card read cooldown set to %d ms\n", __func__, module, readCooldown);
+    if (usingSmartCard)
+        printInfo("%s (%s): Read printed access code from Amusement IC cards: %s\n", __func__, module, readAccessCode ? "on" : "off");
 
     //  Find and initialize reader(s)
     if (!reader_runner_start())

@@ -35,9 +35,9 @@ typedef struct card_info
     uint8_t uid[8];
 } card_info_t;
 
-void scard_update(uint8_t *buf);
+void scard_update(uint8_t *buf, char *accessCode);
 
-void scard_poll(uint8_t *buf, SCARDCONTEXT _hContext, LPCTSTR _readerName, uint8_t unit_no);
+void scard_poll(uint8_t *buf, char *accessCode, SCARDCONTEXT _hContext, LPCTSTR _readerName, uint8_t unit_no);
 
 void scard_clear(uint8_t unitNo);
 

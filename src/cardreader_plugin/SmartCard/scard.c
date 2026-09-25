@@ -24,6 +24,7 @@
  */
 
 #include "scard.h"
+#include "spad0.h"
 #include <windows.h>
 #include <winscard.h>
 // #include <tchar.h>
@@ -33,6 +34,7 @@ extern char module[];
 
 #define MAX_APDU_SIZE 255
 extern int readCooldown;
+extern bool readAccessCode;
 // set to detect all cards, reduce polling rate to 500ms.
 // based off acr122u reader, see page 26 in api document.
 // https://www.acs.com.hk/en/download-manual/419/API-ACR122U-2.04.pdf
@@ -61,7 +63,70 @@ LPTSTR reader_name_slots[2] = {NULL, NULL};
 int reader_count = 0;
 LONG lRet = 0;
 
-void scard_poll(uint8_t *buf, SCARDCONTEXT _hContext, LPCTSTR _readerName, uint8_t unit_no)
+// Read one 16-byte block of a FeliCa card through the ACR122U's PN532.
+// Uses the reader's Direct Transmit pseudo-APDU (FF 00 00 00 Lc ...) wrapping
+// a FeliCa "Read Without Encryption" command (0x06) for a single service/block.
+// Tries InDataExchange (D4 40) first, then InCommunicateThru (D4 42).
+static bool felica_read_block(SCARDHANDLE hCard, LPCSCARD_IO_REQUEST pci, const BYTE idm[8], WORD service, BYTE block, BYTE out[16])
+{
+    static const BYTE pn532Cmds[2][3] = {{0xD4u, 0x40u, 0x01u}, {0xD4u, 0x42u, 0x00u}};
+    static const BYTE pn532Lens[2] = {3, 2};
+
+    for (int attempt = 0; attempt < 2; attempt++)
+    {
+        BYTE apdu[5 + 3 + 16];
+        int n = 0;
+        apdu[n++] = 0xFFu;
+        apdu[n++] = 0x00u;
+        apdu[n++] = 0x00u;
+        apdu[n++] = 0x00u;
+        apdu[n++] = 0x00u; // Lc, filled below
+        for (int i = 0; i < pn532Lens[attempt]; i++)
+            apdu[n++] = pn532Cmds[attempt][i];
+        apdu[n++] = 0x10u; // FeliCa frame length (16 bytes incl. this byte)
+        apdu[n++] = 0x06u; // Read Without Encryption
+        memcpy(&apdu[n], idm, 8);
+        n += 8;
+        apdu[n++] = 0x01u;                  // number of services
+        apdu[n++] = (BYTE)(service & 0xFF); // service code, little endian
+        apdu[n++] = (BYTE)(service >> 8);
+        apdu[n++] = 0x01u;  // number of blocks
+        apdu[n++] = 0x80u;  // 2-byte block list element
+        apdu[n++] = block;
+        apdu[4] = (BYTE)(n - 5);
+
+        BYTE rx[MAX_APDU_SIZE];
+        DWORD rxLen = sizeof(rx);
+        LONG ret = SCardTransmit(hCard, pci, apdu, (DWORD)n, NULL, rx, &rxLen);
+        if (ret != SCARD_S_SUCCESS)
+        {
+            printWarning("%s (%s): FeliCa read (attempt %d) transmit failed: 0x%08X\n", __func__, module, attempt + 1, ret);
+            continue;
+        }
+
+        // Expected: D5 41|43 00 | LEN 07 IDm(8) ST1 ST2 NBLK DATA(16) | 90 00
+        if (rxLen < 3 + 13 + 16 + 2 || rx[0] != 0xD5u || rx[2] != 0x00u || rx[4] != 0x07u)
+        {
+            printWarning("%s (%s): FeliCa read (attempt %d) unexpected response, len %lu, first bytes %02X %02X %02X\n",
+                         __func__, module, attempt + 1, (unsigned long)rxLen, rxLen > 0 ? rx[0] : 0, rxLen > 1 ? rx[1] : 0, rxLen > 2 ? rx[2] : 0);
+            continue;
+        }
+
+        BYTE st1 = rx[13], st2 = rx[14];
+        if (st1 != 0x00u || st2 != 0x00u)
+        {
+            printWarning("%s (%s): FeliCa read rejected by card, status %02X %02X\n", __func__, module, st1, st2);
+            return false;
+        }
+
+        memcpy(out, &rx[16], 16);
+        return true;
+    }
+
+    return false;
+}
+
+void scard_poll(uint8_t *buf, char *accessCode, SCARDCONTEXT _hContext, LPCTSTR _readerName, uint8_t unit_no)
 {
     printInfo("%s (%s): Update on reader : %s\n", __func__, module, reader_states[unit_no].szReader);
     // Connect to the smart card.
@@ -147,6 +212,31 @@ void scard_poll(uint8_t *buf, SCARDCONTEXT _hContext, LPCTSTR _readerName, uint8
         return;
     }
 
+    // Amusement IC (FeliCa): try to read the printed access code from SPAD0 (block 0x00, service 0x000B)
+    accessCode[0] = '\0';
+    if (readAccessCode && (cardProtocol == SCARD_ATR_PROTOCOL_FELICA_212K || cardProtocol == SCARD_ATR_PROTOCOL_FELICA_424K) && cbRecv >= 8)
+    {
+        BYTE idm[8];
+        memcpy(idm, pbRecv, 8);
+        BYTE spad0[16];
+        if (felica_read_block(hCard, pci, idm, 0x000Bu, 0x00u, spad0))
+        {
+            printInfo("%s (%s): SPAD0 raw: %02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X\n", __func__, module,
+                      spad0[0], spad0[1], spad0[2], spad0[3], spad0[4], spad0[5], spad0[6], spad0[7],
+                      spad0[8], spad0[9], spad0[10], spad0[11], spad0[12], spad0[13], spad0[14], spad0[15]);
+            char code[21];
+            if (spad0_access_code(spad0, code))
+            {
+                memcpy(accessCode, code, 21);
+                printWarning("%s (%s): Access code from card: %s\n", __func__, module, accessCode);
+            }
+            else
+                printWarning("%s (%s): SPAD0 has no valid access code, falling back to IDm\n", __func__, module);
+        }
+        else
+            printWarning("%s (%s): Could not read SPAD0, falling back to IDm\n", __func__, module);
+    }
+
     if ((lRet = SCardDisconnect(hCard, SCARD_LEAVE_CARD)) != SCARD_S_SUCCESS)
         printError("%s (%s): Failed SCardDisconnect: 0x%08X\n", __func__, module, lRet);
 
@@ -175,7 +265,7 @@ void scard_clear(uint8_t unitNo)
     card_info_t empty_cardinfo;
 }
 
-void scard_update(uint8_t *buf)
+void scard_update(uint8_t *buf, char *accessCode)
 {
     if (reader_count < 1)
     {
@@ -213,7 +303,7 @@ void scard_update(uint8_t *buf)
         else if (newState & SCARD_STATE_PRESENT && !wasCardPresent)
         {
             printInfo("%s (%s): New card state: present\n", __func__, module);
-            scard_poll(buf, hContext, reader_states[unit_no].szReader, unit_no);
+            scard_poll(buf, accessCode, hContext, reader_states[unit_no].szReader, unit_no);
         }
 
         reader_states[unit_no].dwCurrentState = reader_states[unit_no].dwEventState;
